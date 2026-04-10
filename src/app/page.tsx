@@ -28,7 +28,7 @@ export default function Home() {
             Now in public beta
           </div>
           <h1 className="text-5xl md:text-6xl font-bold tracking-tight leading-tight mb-6">
-            Ship faster.<br />Scale with confidence.
+            Hello octav
           </h1>
           <p className="text-lg text-muted-foreground max-w-xl mx-auto mb-10">
             Orbit gives your team the tools to build, deploy, and monitor modern web applications — without the operational overhead.
