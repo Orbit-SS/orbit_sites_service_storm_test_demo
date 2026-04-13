@@ -44,11 +44,21 @@ function sendSSE(res, data) {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
+// Stop state — shared across requests
+let stopRequested = false;
+let activeRes = null;
+
 app.get("/messages", (_req, res) => {
   res.json(messages);
 });
 
-
+app.post("/stop", (_req, res) => {
+  stopRequested = true;
+  if (activeRes) {
+    sendSSE(activeRes, { type: "stopped" });
+  }
+  res.json({ ok: true });
+});
 
 app.post("/message", async (req, res) => {
   const { message, attachments = [] } = req.body;
@@ -59,6 +69,9 @@ app.post("/message", async (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
+
+  stopRequested = false;
+  activeRes = res;
 
   // Keep connection alive during long operations (proxies kill idle SSE streams)
   const heartbeat = setInterval(() => res.write(": ping\n\n"), 15000);
@@ -87,6 +100,7 @@ app.post("/message", async (req, res) => {
     await session.send(sendArg);
 
     for await (const msg of stream) {
+      if (stopRequested) break;
       switch (msg.type) {
         case "assistant": {
           const text = msg.message.content
