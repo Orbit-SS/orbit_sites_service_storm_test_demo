@@ -4,7 +4,7 @@
 import express from "express";
 import cors from "cors";
 import { execSync } from "child_process";
-import { unstable_v2_createSession } from "@anthropic-ai/claude-agent-sdk";
+import { query } from "@anthropic-ai/claude-agent-sdk";
 import "dotenv/config";
 
 const PORT = 4000;
@@ -14,8 +14,6 @@ const PORT = 4000;
 const ALLOWED_BRANCH = process.env.SANDBOX_BRANCH || null;
 
 // Authoritative branch checkout — runs before anything else.
-// The sandbox setup already tries this, but can race against git fetch.
-// Doing it here guarantees we're on the right branch before the first message.
 if (ALLOWED_BRANCH) {
   try {
     execSync(`git fetch origin ${ALLOWED_BRANCH}`, { cwd: "/vercel/sandbox", stdio: "pipe" });
@@ -28,34 +26,52 @@ if (ALLOWED_BRANCH) {
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '20mb' }));
 
 // In-memory message log
 const messages = [];
-
-// One session per sandbox lifetime (persists conversation across messages)
-const session = unstable_v2_createSession({
-  model: "claude-sonnet-4-6",
-  permissionMode: "auto",
-  allowedTools: ["Read", "Edit", "Write", "Bash", "Glob", "Grep", "WebFetch"],
-});
 
 function sendSSE(res, data) {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
-// Stop state — shared across requests
-let stopRequested = false;
+// Track the current running query so we can interrupt it
+let currentQuery = null;
 let activeRes = null;
+// After a stop, start a fresh session (don't continue the interrupted one)
+let freshSession = true;
+
+// Build a prompt for query() — string for text-only, AsyncIterable for attachments
+function makePrompt(message, attachments) {
+  if (!attachments || attachments.length === 0) return message;
+
+  const content = [];
+  for (const att of attachments) {
+    if (att.mediaType.startsWith('image/')) {
+      content.push({ type: 'image', source: { type: 'base64', media_type: att.mediaType, data: att.data } });
+    } else {
+      const decoded = Buffer.from(att.data, 'base64').toString('utf-8').slice(0, 20000);
+      content.push({ type: 'text', text: `[File: ${att.name}]\n${decoded}` });
+    }
+  }
+  if (message) content.push({ type: 'text', text: message });
+
+  return (async function* () {
+    yield {
+      type: 'user',
+      message: { role: 'user', content },
+      parent_tool_use_id: null,
+    };
+  })();
+}
 
 app.get("/messages", (_req, res) => {
   res.json(messages);
 });
 
-app.post("/stop", (_req, res) => {
-  stopRequested = true;
-  if (activeRes) {
-    sendSSE(activeRes, { type: "stopped" });
+app.post("/stop", async (_req, res) => {
+  if (currentQuery) {
+    await currentQuery.interrupt();
   }
   res.json({ ok: true });
 });
@@ -63,44 +79,34 @@ app.post("/stop", (_req, res) => {
 app.post("/message", async (req, res) => {
   const { message, attachments = [] } = req.body;
 
-  // Log user message
   messages.push({ role: "user", content: message || "(attachment)" });
 
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
 
-  stopRequested = false;
   activeRes = res;
 
-  // Keep connection alive during long operations (proxies kill idle SSE streams)
   const heartbeat = setInterval(() => res.write(": ping\n\n"), 15000);
 
   let assistantText = "";
 
   try {
-    // Build content array when attachments are present
-    let sendArg = message;
-    if (attachments.length > 0) {
-      const content = [];
-      for (const att of attachments) {
-        if (att.mediaType.startsWith('image/')) {
-          content.push({ type: 'image', source: { type: 'base64', media_type: att.mediaType, data: att.data } });
-        } else {
-          const decoded = Buffer.from(att.data, 'base64').toString('utf-8').slice(0, 20000);
-          content.push({ type: 'text', text: `[File: ${att.name}]\n${decoded}` });
-        }
-      }
-      if (message) content.push({ type: 'text', text: message });
-      sendArg = content;
-    }
+    const useContinue = !freshSession;
+    freshSession = false;
 
-    // Start streaming before sending so we don't miss events
-    const stream = session.stream();
-    await session.send(sendArg);
+    currentQuery = query({
+      prompt: makePrompt(message, attachments),
+      options: {
+        model: "claude-sonnet-4-6",
+        permissionMode: "auto",
+        allowedTools: ["Read", "Edit", "Write", "Bash", "Glob", "Grep", "WebFetch"],
+        cwd: "/vercel/sandbox",
+        ...(useContinue ? { continue: true } : {}),
+      },
+    });
 
-    for await (const msg of stream) {
-      if (stopRequested) break;
+    for await (const msg of currentQuery) {
       switch (msg.type) {
         case "assistant": {
           const text = msg.message.content
@@ -128,25 +134,33 @@ app.post("/message", async (req, res) => {
           break;
 
         case "result":
-          // Auto-commit and push on success
           if (msg.subtype === "success") {
             try {
-              // Branch protection: only push to the allowed branch
               const currentBranch = execSync("git rev-parse --abbrev-ref HEAD", { cwd: "/vercel/sandbox" })
                 .toString()
                 .trim();
 
               if (ALLOWED_BRANCH && currentBranch !== ALLOWED_BRANCH) {
-                // Silently skip — do not push to an unintended branch
                 console.warn(`[agent-server] Skipping push: on '${currentBranch}', expected '${ALLOWED_BRANCH}'`);
               } else {
-                execSync("git add -A", { cwd: "/vercel/sandbox" });
-                execSync(`git commit -m "${message.replace(/"/g, '\\"').replace(/`/g, "\\`").replace(/\$/g, "\\$")}"`, { cwd: "/vercel/sandbox" });
-                execSync("git push", { cwd: "/vercel/sandbox" });
-                sendSSE(res, { type: "saved" });
+                const madeChanges = (() => {
+                  try {
+                    execSync("git diff --quiet HEAD", { cwd: "/vercel/sandbox" });
+                    return false;
+                  } catch {
+                    return true;
+                  }
+                })();
+
+                if (madeChanges) {
+                  execSync("git add -A", { cwd: "/vercel/sandbox" });
+                  execSync(`git commit -m "${message.replace(/"/g, '\\"').replace(/`/g, "\\`").replace(/\$/g, "\\$")}"`, { cwd: "/vercel/sandbox" });
+                  execSync("git push", { cwd: "/vercel/sandbox" });
+                  sendSSE(res, { type: "saved" });
+                }
               }
             } catch (e) {
-              // No changes to commit is fine
+              // commit/push errors are non-fatal
             }
           }
           sendSSE(res, { type: "done", result: msg.subtype });
@@ -154,17 +168,22 @@ app.post("/message", async (req, res) => {
       }
     }
 
-    // Log the full assistant reply
     if (assistantText) {
       messages.push({ role: "assistant", content: assistantText });
     }
   } catch (err) {
-    sendSSE(res, { type: "error", message: err.message });
+    const isInterrupt = err?.message?.includes('aborted') || err?.message?.includes('interrupt') || err?.message?.includes('ede_diagnostic');
+    if (isInterrupt) {
+      sendSSE(res, { type: "stopped" });
+    } else {
+      sendSSE(res, { type: "error", message: err.message });
+    }
   } finally {
+    currentQuery = null;
+    activeRes = null;
     clearInterval(heartbeat);
     res.end();
   }
 });
-
 
 app.listen(PORT, () => console.log(`Agent server on :${PORT}`));
